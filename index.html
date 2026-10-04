@@ -109,19 +109,62 @@ body {
 		</div>
 
 		<script>
-// Browsers start audio suspended until a gesture: keep every AudioContext the
-// engine makes and resume them on the first tap / click / key.
+// Browsers start audio suspended until a gesture. iOS Safari is stricter:
+// * only touchend / click / keydown count as unlocking gestures;
+// * resume() alone may not start the context: a (silent) sound has to be
+//   started inside the gesture too;
+// * with the ring/silent switch on silent, Web Audio stays muted unless an
+//   HTML <audio> element is playing, which moves the page's audio session to
+//   "playback" (navigator.audioSession does the same on iOS 17+);
+// * a call or app switch leaves contexts "interrupted": unlock again then.
+// So: keep every AudioContext the engine makes, and on every gesture resume
+// any that aren't running and tick each with a one-sample silent buffer; on
+// the first gesture also start a silent looping <audio> element.
 (function () {
 	const AC = window.AudioContext || window.webkitAudioContext;
 	const ctxs = [];
+	window.__csAudio = { ctxs, tag: () => tag };  // read-only debug handle (tests)
 	if (AC) {
 		const Wrapped = function (...args) { const c = new AC(...args); ctxs.push(c); return c; };
 		Wrapped.prototype = AC.prototype;
 		window.AudioContext = Wrapped;
 		if (window.webkitAudioContext) { window.webkitAudioContext = Wrapped; }
 	}
-	const unlock = () => ctxs.forEach((c) => { if (c.state !== 'running' && c.state !== 'closed') { c.resume(); } });
-	['pointerdown', 'pointerup', 'touchend', 'keydown', 'click'].forEach((e) => document.addEventListener(e, unlock, true));
+	// 0.1 s of 8 kHz mono silence (WAV), looped quietly to hold the audio session
+	const SILENCE = 'data:audio/wav;base64,UklGRkQDAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YSADAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgA==';
+	let tag = null;
+	const holdSession = () => {
+		try { if (navigator.audioSession) { navigator.audioSession.type = 'playback'; } } catch (e) { /* older Safari */ }
+		if (tag) { if (tag.paused) { tag.play().catch(() => {}); } return; }
+		tag = document.createElement('audio');
+		tag.src = SILENCE;
+		tag.loop = true;
+		tag.setAttribute('playsinline', '');
+		tag.volume = 0.01;
+		tag.play().catch(() => {});
+	};
+	const tick = (c) => {
+		try {
+			const b = c.createBuffer(1, 1, c.sampleRate || 22050);
+			const src = c.createBufferSource();
+			src.buffer = b;
+			src.connect(c.destination);
+			src.start(0);
+		} catch (e) { /* context closed */ }
+	};
+	const unlock = () => {
+		holdSession();
+		ctxs.forEach((c) => {
+			if (c.state === 'closed') { return; }
+			if (c.state !== 'running') { c.resume().catch(() => {}); }
+			tick(c);
+		});
+	};
+	['touchend', 'pointerup', 'click', 'keydown'].forEach((e) => document.addEventListener(e, unlock, true));
+	// coming back from the background (iOS "interrupted"): the next tap unlocks again
+	document.addEventListener('visibilitychange', () => {
+		if (document.visibilityState === 'visible' && tag && tag.paused) { tag.play().catch(() => {}); }
+	});
 }());
 		</script>
 		<script src="index.js"></script>
